@@ -17,11 +17,12 @@ contract Strategy is AMMStrategyBase {
     uint256 constant SLOT_CONSEC = 4;
 
     uint256 constant MAX_FEE_CAP = 50 * BPS;
-    uint256 constant RETAIL_FEE = 42 * BPS;  // lower fee on the retail-expected side
+    // Optimizer-found params (differential evolution, 40 evals, 30 sims each)
+    uint256 constant RETAIL_FEE = 49 * BPS;  // barely dip — optimizer says stay near ceiling
 
     uint256 constant ALPHA = WAD / 5;
     uint256 constant ONE_MINUS_ALPHA = WAD - ALPHA;
-    uint256 constant ARB_MULT = 18 * WAD / 10;
+    uint256 constant ARB_MULT = 26 * WAD / 10;  // 2.6x EMA threshold
 
     function afterInitialize(uint256, uint256) external override returns (uint256, uint256) {
         slots[SLOT_BID] = MAX_FEE_CAP;
@@ -67,10 +68,10 @@ contract Strategy is AMMStrategyBase {
             uint256 prevBid = slots[SLOT_BID];
             uint256 prevAsk = slots[SLOT_ASK];
             bidFee = prevBid < MAX_FEE_CAP
-                ? prevBid + wmul(5 * WAD / 10, MAX_FEE_CAP - prevBid)
+                ? prevBid + wmul(67 * WAD / 100, MAX_FEE_CAP - prevBid)
                 : MAX_FEE_CAP;
             askFee = prevAsk < MAX_FEE_CAP
-                ? prevAsk + wmul(5 * WAD / 10, MAX_FEE_CAP - prevAsk)
+                ? prevAsk + wmul(67 * WAD / 100, MAX_FEE_CAP - prevAsk)
                 : MAX_FEE_CAP;
         }
 
