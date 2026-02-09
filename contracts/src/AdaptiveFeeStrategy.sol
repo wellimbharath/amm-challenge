@@ -5,27 +5,29 @@ import {AMMStrategyBase} from "./AMMStrategyBase.sol";
 import {IAMMStrategy, TradeInfo} from "./IAMMStrategy.sol";
 
 /// @title Adaptive Fee Strategy
-/// @notice Stays at a base fee of ~50bps. After detecting retail trades
-///         (which push price away from fair value), spikes fees to protect
-///         against imminent arb. After arb corrects price, decays back to base.
-///         Never drops below base — arb protection always on.
+/// @notice Max fee 50bps. Uses asymmetric bid/ask after detecting arb.
+///         After arb bought X (price pushed down), retail likely sells X →
+///         lower bid fee to attract that retail, keep ask at 50bps.
+///         After arb sold X, retail likely buys X → lower ask, keep bid at 50.
 contract Strategy is AMMStrategyBase {
-    uint256 constant SLOT_FEE = 0;
-    uint256 constant SLOT_EMA_SIZE = 1;
-    uint256 constant SLOT_LAST_DIR = 2;
-    uint256 constant SLOT_CONSEC = 3;
+    uint256 constant SLOT_BID = 0;
+    uint256 constant SLOT_ASK = 1;
+    uint256 constant SLOT_EMA_SIZE = 2;
+    uint256 constant SLOT_LAST_DIR = 3;
+    uint256 constant SLOT_CONSEC = 4;
 
-    uint256 constant BASE_FEE = 50 * BPS;   // resting fee — matches best static
-    uint256 constant SPIKE_FEE = 80 * BPS;  // after retail → arb incoming
+    uint256 constant MAX_FEE_CAP = 50 * BPS;
+    uint256 constant RETAIL_FEE = 42 * BPS;  // lower fee on the retail-expected side
 
     uint256 constant ALPHA = WAD / 5;
     uint256 constant ONE_MINUS_ALPHA = WAD - ALPHA;
     uint256 constant ARB_MULT = 18 * WAD / 10;
 
     function afterInitialize(uint256, uint256) external override returns (uint256, uint256) {
-        slots[SLOT_FEE] = BASE_FEE;
+        slots[SLOT_BID] = MAX_FEE_CAP;
+        slots[SLOT_ASK] = MAX_FEE_CAP;
         slots[SLOT_EMA_SIZE] = WAD / 100;
-        return (BASE_FEE, BASE_FEE);
+        return (MAX_FEE_CAP, MAX_FEE_CAP);
     }
 
     function afterSwap(TradeInfo calldata trade) external override returns (uint256, uint256) {
@@ -46,36 +48,41 @@ contract Strategy is AMMStrategyBase {
         // Classify
         bool likelyArb = sizeRatio > wmul(ARB_MULT, ema) || consec >= 3;
 
-        // After arb → decay toward base (price is corrected)
-        // After retail → spike fees (arb coming next)
-        uint256 prevFee = slots[SLOT_FEE];
-        uint256 fee;
+        uint256 bidFee;
+        uint256 askFee;
 
         if (likelyArb) {
-            // Decay toward base: drop 30% of distance per step
-            if (prevFee > BASE_FEE) {
-                uint256 gap = prevFee - BASE_FEE;
-                fee = prevFee - wmul(3 * WAD / 10, gap);
+            // Arb corrected price. Lower fee only on the side retail will use.
+            if (trade.isBuy) {
+                // Arb bought X → price went down → retail likely sells X (AMM buys X)
+                bidFee = RETAIL_FEE;
+                askFee = MAX_FEE_CAP;
             } else {
-                fee = BASE_FEE;
+                // Arb sold X → price went up → retail likely buys X (AMM sells X)
+                askFee = RETAIL_FEE;
+                bidFee = MAX_FEE_CAP;
             }
         } else {
-            // Retail → spike. Scale by how large the retail trade was
-            uint256 sizeScale = wdiv(sizeRatio, ema);
-            if (sizeScale > WAD) {
-                // Above-average retail → full spike
-                fee = SPIKE_FEE;
-            } else {
-                // Small retail → moderate bump
-                fee = BASE_FEE + wmul(sizeScale, SPIKE_FEE - BASE_FEE);
-            }
+            // Retail just happened → ratchet both back toward ceiling
+            uint256 prevBid = slots[SLOT_BID];
+            uint256 prevAsk = slots[SLOT_ASK];
+            bidFee = prevBid < MAX_FEE_CAP
+                ? prevBid + wmul(5 * WAD / 10, MAX_FEE_CAP - prevBid)
+                : MAX_FEE_CAP;
+            askFee = prevAsk < MAX_FEE_CAP
+                ? prevAsk + wmul(5 * WAD / 10, MAX_FEE_CAP - prevAsk)
+                : MAX_FEE_CAP;
         }
 
-        fee = clampFee(fee);
-        if (fee < BASE_FEE) fee = BASE_FEE; // never below base
-        slots[SLOT_FEE] = fee;
+        // Hard cap
+        if (bidFee > MAX_FEE_CAP) bidFee = MAX_FEE_CAP;
+        if (askFee > MAX_FEE_CAP) askFee = MAX_FEE_CAP;
+        bidFee = clampFee(bidFee);
+        askFee = clampFee(askFee);
+        slots[SLOT_BID] = bidFee;
+        slots[SLOT_ASK] = askFee;
 
-        return (fee, fee);
+        return (bidFee, askFee);
     }
 
     function getName() external pure override returns (string memory) {
