@@ -4,70 +4,44 @@ pragma solidity ^0.8.24;
 import {AMMStrategyBase} from "./AMMStrategyBase.sol";
 import {TradeInfo} from "./IAMMStrategy.sol";
 
-/// @title Combined Directional + Widen Strategy
-/// @notice Merges two concepts:
-///   1. Widen after big trades: bump fees up when a large trade hits, decay back otherwise
-///   2. Directional asymmetry: after a price move, penalize continuation and reward reversal
+/// @title Arb/Retail Discriminator Strategy
+/// @notice Uses timestamp tracking to detect whether a trade is likely arb or retail.
+/// @dev In each simulation step: arbs trade first, then retail arrives via Poisson.
+///      - First trade in a new step (timestamp changed) = likely arb
+///      - Subsequent trades in same step (timestamp unchanged) = likely retail
+///      After arb: set LOW fees to attract retail that follows in the same step.
+///      After retail: set HIGH fees to protect against the arb that opens the next step.
 contract Strategy is AMMStrategyBase {
-    // slots[0] = symmetric base fee level (adapts via widen/decay)
-    // slots[1] = last price (WAD)
+    // slots[0] = last timestamp
 
-    uint256 constant STARTING_FEE = 80 * BPS;  // 80 bps starting fee
-    uint256 constant MIN_BASE = 60 * BPS;       // decay floor
-    uint256 constant WIDEN_AMOUNT = 15 * BPS;   // bump on big trades
-    uint256 constant DECAY_AMOUNT = 1 * BPS;    // decay per small trade
-    uint256 constant BIG_TRADE_THRESHOLD = WAD / 20; // 5% of reserves
-    uint256 constant C = 2e16;                  // 0.02 directional adjustment
+    uint256 constant ARB_FEE = 85 * BPS;       // high fee to catch arbs
+    uint256 constant RETAIL_FEE = 75 * BPS;     // low fee to attract retail
 
-    function afterInitialize(uint256 initialX, uint256 initialY)
+    function afterInitialize(uint256, uint256)
         external override returns (uint256, uint256)
     {
-        slots[0] = STARTING_FEE;
-        slots[1] = wdiv(initialY, initialX);
-        return (STARTING_FEE, STARTING_FEE);
+        // First trade will be arb (step 0), set high fees
+        return (ARB_FEE, ARB_FEE);
     }
 
     function afterSwap(TradeInfo calldata trade)
         external override returns (uint256, uint256)
     {
-        uint256 baseFee = slots[0];
-        uint256 lastPrice = slots[1];
+        uint256 lastTimestamp = slots[0];
 
-        // --- Widen / Decay ---
-        uint256 tradeRatio = wdiv(trade.amountY, trade.reserveY);
-        if (tradeRatio > BIG_TRADE_THRESHOLD) {
-            baseFee = clampFee(baseFee + WIDEN_AMOUNT);
+        if (trade.timestamp != lastTimestamp) {
+            // New step — this trade was the first in this step (likely arb)
+            // Set LOW fees for the next trade (likely retail in same step)
+            slots[0] = trade.timestamp;
+            return (RETAIL_FEE, RETAIL_FEE);
         } else {
-            if (baseFee > MIN_BASE) {
-                baseFee = baseFee - DECAY_AMOUNT;
-            }
+            // Same step — this trade was retail
+            // Set HIGH fees for the next trade (likely arb in next step)
+            return (ARB_FEE, ARB_FEE);
         }
-
-        // --- Directional Asymmetry ---
-        uint256 currentPrice = wdiv(trade.reserveY, trade.reserveX);
-        uint256 bidFee = baseFee;
-        uint256 askFee = baseFee;
-
-        if (currentPrice > lastPrice) {
-            uint256 delta = wdiv(currentPrice - lastPrice, lastPrice);
-            uint256 adj = wmul(C, delta);
-            askFee = clampFee(baseFee + adj);
-            bidFee = adj >= baseFee ? 0 : baseFee - adj;
-        } else if (currentPrice < lastPrice) {
-            uint256 delta = wdiv(lastPrice - currentPrice, lastPrice);
-            uint256 adj = wmul(C, delta);
-            bidFee = clampFee(baseFee + adj);
-            askFee = adj >= baseFee ? 0 : baseFee - adj;
-        }
-
-        // --- Store state ---
-        slots[0] = baseFee;
-        slots[1] = currentPrice;
-
-        return (bidFee, askFee);
     }
 
     function getName() external pure override returns (string memory) {
-        return "DirectionalWiden";
+        return "ArbRetailDiscriminator";
     }
 }
