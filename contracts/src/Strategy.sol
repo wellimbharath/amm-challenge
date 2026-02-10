@@ -14,8 +14,8 @@ import {TradeInfo} from "./IAMMStrategy.sol";
 contract Strategy is AMMStrategyBase {
     // slots[0] = last timestamp
 
-    uint256 constant ARB_FEE = 105 * BPS;      // high fee to catch arbs
-    uint256 constant RETAIL_FEE = 95 * BPS;     // low fee to attract retail
+    uint256 constant ARB_FEE = 85 * BPS;       // high fee to catch arbs
+    uint256 constant RETAIL_FEE = 75 * BPS;     // low fee to attract retail
 
     function afterInitialize(uint256, uint256)
         external override returns (uint256, uint256)
