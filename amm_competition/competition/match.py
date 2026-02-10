@@ -1,5 +1,6 @@
 """Match runner for baseline vs submission simulations using Rust engine."""
 
+import gc
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Optional
@@ -138,6 +139,9 @@ class MatchRunner:
             configs.append(cfg)
         return configs
 
+    # Maximum simulations per batch to avoid memory exhaustion / segfault
+    BATCH_SIZE = 20
+
     def run_match(
         self,
         strategy_a: EVMStrategyAdapter,
@@ -151,15 +155,8 @@ class MatchRunner:
         # Build configs
         configs = self._build_configs()
 
-        # Run simulations in Rust
-        batch_result = amm_sim_rs.run_batch(
-            list(strategy_a._bytecode),
-            list(strategy_b._bytecode),
-            configs,
-            self.n_workers,
-        )
-
-        # Process results
+        # Process results - run in batches and aggregate immediately
+        # to avoid accumulating Rust objects in memory
         wins_a = 0
         wins_b = 0
         draws = 0
@@ -169,53 +166,68 @@ class MatchRunner:
         total_edge_b = Decimal("0")
         simulation_results = []
 
-        for rust_result in batch_result.results:
-            # Get PnL values using fixed positional keys from Rust
-            pnl_a = rust_result.pnl.get("submission", 0.0)
-            pnl_b = rust_result.pnl.get("normalizer", 0.0)
-            edge_a = rust_result.edges.get("submission", 0.0)
-            edge_b = rust_result.edges.get("normalizer", 0.0)
+        bytecode_a = list(strategy_a._bytecode)
+        bytecode_b = list(strategy_b._bytecode)
+        for batch_start in range(0, len(configs), self.BATCH_SIZE):
+            batch_configs = configs[batch_start:batch_start + self.BATCH_SIZE]
+            batch_result = amm_sim_rs.run_batch(
+                bytecode_a,
+                bytecode_b,
+                batch_configs,
+                self.n_workers,
+            )
 
-            total_pnl_a += Decimal(str(pnl_a))
-            total_pnl_b += Decimal(str(pnl_b))
-            total_edge_a += Decimal(str(edge_a))
-            total_edge_b += Decimal(str(edge_b))
+            for rust_result in batch_result.results:
+                # Get PnL values using fixed positional keys from Rust
+                pnl_a = rust_result.pnl.get("submission", 0.0)
+                pnl_b = rust_result.pnl.get("normalizer", 0.0)
+                edge_a = rust_result.edges.get("submission", 0.0)
+                edge_b = rust_result.edges.get("normalizer", 0.0)
 
-            if edge_a > edge_b:
-                wins_a += 1
-            elif edge_b > edge_a:
-                wins_b += 1
-            else:
-                draws += 1
+                total_pnl_a += Decimal(str(pnl_a))
+                total_pnl_b += Decimal(str(pnl_b))
+                total_edge_a += Decimal(str(edge_a))
+                total_edge_b += Decimal(str(edge_b))
 
-            if store_results:
-                # Convert Rust result to Python dataclass
-                steps = [
-                    LightweightStepResult(
-                        timestamp=s.timestamp,
-                        fair_price=s.fair_price,
-                        spot_prices=s.spot_prices,
-                        pnls=s.pnls,
-                        fees=s.fees,
+                if edge_a > edge_b:
+                    wins_a += 1
+                elif edge_b > edge_a:
+                    wins_b += 1
+                else:
+                    draws += 1
+
+                if store_results:
+                    # Convert Rust result to Python dataclass
+                    steps = [
+                        LightweightStepResult(
+                            timestamp=s.timestamp,
+                            fair_price=s.fair_price,
+                            spot_prices=s.spot_prices,
+                            pnls=s.pnls,
+                            fees=s.fees,
+                        )
+                        for s in rust_result.steps
+                    ]
+
+                    sim_result = LightweightSimResult(
+                        seed=rust_result.seed,
+                        strategies=rust_result.strategies,
+                        pnl={k: Decimal(str(v)) for k, v in rust_result.pnl.items()},
+                        edges={
+                            k: Decimal(str(v)) for k, v in rust_result.edges.items()
+                        },
+                        initial_fair_price=rust_result.initial_fair_price,
+                        initial_reserves=rust_result.initial_reserves,
+                        steps=steps,
+                        arb_volume_y=rust_result.arb_volume_y,
+                        retail_volume_y=rust_result.retail_volume_y,
+                        average_fees=rust_result.average_fees,
                     )
-                    for s in rust_result.steps
-                ]
+                    simulation_results.append(sim_result)
 
-                sim_result = LightweightSimResult(
-                    seed=rust_result.seed,
-                    strategies=rust_result.strategies,
-                    pnl={k: Decimal(str(v)) for k, v in rust_result.pnl.items()},
-                    edges={
-                        k: Decimal(str(v)) for k, v in rust_result.edges.items()
-                    },
-                    initial_fair_price=rust_result.initial_fair_price,
-                    initial_reserves=rust_result.initial_reserves,
-                    steps=steps,
-                    arb_volume_y=rust_result.arb_volume_y,
-                    retail_volume_y=rust_result.retail_volume_y,
-                    average_fees=rust_result.average_fees,
-                )
-                simulation_results.append(sim_result)
+            # Free Rust objects between batches
+            del batch_result
+            gc.collect()
 
         return MatchResult(
             strategy_a=name_a,

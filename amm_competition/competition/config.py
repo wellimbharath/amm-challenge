@@ -70,8 +70,13 @@ def baseline_nominal_retail_size() -> float:
 
 
 def resolve_n_workers() -> int:
-    """Resolve worker count from environment or CPU count."""
-    return int(os.environ.get("N_WORKERS", str(min(8, multiprocessing.cpu_count()))))
+    """Resolve worker count from environment or CPU count.
+
+    Caps at 4 by default to avoid memory exhaustion from parallel EVM
+    deployments in the Rust engine. Each worker creates fresh EVM instances
+    per simulation, so too many workers causes segfaults at high sim counts.
+    """
+    return int(os.environ.get("N_WORKERS", str(min(2, multiprocessing.cpu_count()))))
 
 
 def build_base_config(*, seed: int | None) -> amm_sim_rs.SimulationConfig:
